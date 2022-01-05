@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-import numpy as np
 from typing import Optional, Tuple
 
 
@@ -13,8 +12,7 @@ class ScaledDotProductAttention(nn.Module):
     Compute the dot products of the query with all keys, divide each by sqrt(dim),
     and apply a softmax function to obtain the weights on the values
 
-    Args: dim, mask
-        dim (int): dimention of attention
+    Args: mask
         mask (torch.Tensor): tensor containing indices to be masked
 
     Inputs: query, key, value, mask
@@ -27,12 +25,12 @@ class ScaledDotProductAttention(nn.Module):
         - **context**: tensor containing the context vector from attention mechanism.
         - **attn**: tensor containing the attention (alignment) from the encoder outputs.
     """
-    def __init__(self, dim: int):
+    def __init__(self):
         super(ScaledDotProductAttention, self).__init__()
-        self.sqrt_dim = np.sqrt(dim)
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        score = torch.bmm(query, key.transpose(1, 2)) / self.sqrt_dim
+        d_model = query.size(2)
+        score = torch.bmm(query, key.transpose(1, 2)) / math.sqrt(d_model)
 
         if mask is not None:
             score.masked_fill_(mask.view(score.size()), -float('Inf'))
@@ -127,19 +125,18 @@ class LocationAwareAttention(nn.Module):
         self.bias = nn.Parameter(torch.rand(hidden_dim).uniform_(-0.1, 0.1))
         self.smoothing = smoothing
 
-    def forward(self, query: Tensor, value: Tensor, last_attn: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, query: Tensor, value: Tensor, last_attn: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         batch_size, hidden_dim, seq_len = query.size(0), query.size(2), value.size(1)
 
         # Initialize previous attention (alignment) to zeros
         if last_attn is None:
             last_attn = value.new_zeros(batch_size, seq_len)
 
+        query = self._proj(self.query_proj, query, batch_size, hidden_dim)
+        value = self._proj(self.value_proj, value, batch_size, hidden_dim)
         conv_attn = torch.transpose(self.conv1d(last_attn.unsqueeze(1)), 1, 2)
         score = self.score_proj(torch.tanh(
-                self.query_proj(query.reshape(-1, hidden_dim)).view(batch_size, -1, hidden_dim)
-                + self.value_proj(value.reshape(-1, hidden_dim)).view(batch_size, -1, hidden_dim)
-                + conv_attn
-                + self.bias
+            query + value + conv_attn + self.bias
         )).squeeze(dim=-1)
 
         if self.smoothing:
@@ -151,6 +148,9 @@ class LocationAwareAttention(nn.Module):
         context = torch.bmm(attn.unsqueeze(dim=1), value).squeeze(dim=1)  # Bx1xT X BxTxD => Bx1xD => BxD
 
         return context, attn
+
+    def _proj(self, proj: nn.Module, x: Tensor, batch_size: int, hidden_dim: int) -> Tensor:
+        return proj(x.reshape(-1, hidden_dim)).view(batch_size, -1, hidden_dim)
 
 
 class MultiHeadLocationAwareAttention(nn.Module):
@@ -185,12 +185,12 @@ class MultiHeadLocationAwareAttention(nn.Module):
         self.dim = int(hidden_dim / num_heads)
         self.conv1d = nn.Conv1d(num_heads, conv_out_channel, kernel_size=3, padding=1)
         self.loc_proj = nn.Linear(conv_out_channel, self.dim, bias=False)
-        self.query_proj = nn.Linear(hidden_dim, self.dim * num_heads, bias=False)
-        self.value_proj = nn.Linear(hidden_dim, self.dim * num_heads, bias=False)
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.value_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.score_proj = nn.Linear(self.dim, 1, bias=True)
         self.bias = nn.Parameter(torch.rand(self.dim).uniform_(-0.1, 0.1))
 
-    def forward(self, query: Tensor, value: Tensor, last_attn: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, query: Tensor, value: Tensor, last_attn: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         batch_size, seq_len = value.size(0), value.size(1)
 
         if last_attn is None:
@@ -199,22 +199,24 @@ class MultiHeadLocationAwareAttention(nn.Module):
         loc_energy = torch.tanh(self.loc_proj(self.conv1d(last_attn).transpose(1, 2)))
         loc_energy = loc_energy.unsqueeze(1).repeat(1, self.num_heads, 1, 1).view(-1, seq_len, self.dim)
 
-        query = self.query_proj(query).view(batch_size, -1, self.num_heads, self.dim).permute(0, 2, 1, 3)
-        value = self.value_proj(value).view(batch_size, -1, self.num_heads, self.dim).permute(0, 2, 1, 3)
+        query = self._proj(self.query_proj, query, batch_size)
+        value = self._proj(self.value_proj, value, batch_size)
         query = query.contiguous().view(-1, 1, self.dim)
         value = value.contiguous().view(-1, seq_len, self.dim)
 
         score = self.score_proj(torch.tanh(value + query + loc_energy + self.bias)).squeeze(2)
         attn = F.softmax(score, dim=1)
 
-        value = value.view(batch_size, seq_len, self.num_heads, self.dim).permute(0, 2, 1, 3)
+        value = value.view(batch_size, seq_len, self.hidden_dim).permute(0, 2, 1, 3)
         value = value.contiguous().view(-1, seq_len, self.dim)
 
-        context = torch.bmm(attn.unsqueeze(1), value).view(batch_size, -1, self.num_heads * self.dim)
+        context = torch.bmm(attn.unsqueeze(1), value).view(batch_size, -1, self.hidden_dim)
         attn = attn.view(batch_size, self.num_heads, -1)
 
         return context, attn
 
+    def _proj(self, proj: nn.Module, x: Tensor, batch_size: int) -> Tensor:
+        return proj(x).view(batch_size, -1, self.hidden_dim).permute(0, 2, 1, 3)
 
 class MultiHeadAttention(nn.Module):
     """
@@ -262,9 +264,9 @@ class MultiHeadAttention(nn.Module):
         self.d_head = int(d_model / num_heads)
         self.num_heads = num_heads
         self.scaled_dot_attn = ScaledDotProductAttention(self.d_head)
-        self.query_proj = nn.Linear(d_model, self.d_head * num_heads)
-        self.key_proj = nn.Linear(d_model, self.d_head * num_heads)
-        self.value_proj = nn.Linear(d_model, self.d_head * num_heads)
+        self.query_proj = nn.Linear(d_model, d_model)
+        self.key_proj = nn.Linear(d_model, d_model)
+        self.value_proj = nn.Linear(d_model, d_model)
 
     def forward(
             self,
@@ -275,13 +277,9 @@ class MultiHeadAttention(nn.Module):
     ) -> Tuple[Tensor, Tensor]:
         batch_size = value.size(0)
 
-        query = self.query_proj(query).view(batch_size, -1, self.num_heads, self.d_head)  # BxQ_LENxNxD
-        key = self.key_proj(key).view(batch_size, -1, self.num_heads, self.d_head)      # BxK_LENxNxD
-        value = self.value_proj(value).view(batch_size, -1, self.num_heads, self.d_head)  # BxV_LENxNxD
-
-        query = query.permute(2, 0, 1, 3).contiguous().view(batch_size * self.num_heads, -1, self.d_head)  # BNxQ_LENxD
-        key = key.permute(2, 0, 1, 3).contiguous().view(batch_size * self.num_heads, -1, self.d_head)      # BNxK_LENxD
-        value = value.permute(2, 0, 1, 3).contiguous().view(batch_size * self.num_heads, -1, self.d_head)  # BNxV_LENxD
+        query = self._proj(self.query_proj, query, batch_size)
+        key = self._proj(self.key_proj, key, batch_size)
+        value = self._proj(self.value_proj, value, batch_size)
 
         if mask is not None:
             mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1)  # BxNxQ_LENxK_LEN
@@ -293,6 +291,9 @@ class MultiHeadAttention(nn.Module):
 
         return context, attn
 
+    def _proj(self, proj: nn.Module, x: Tensor, batch_size: int) -> Tensor:
+        x = proj(x).view(batch_size, -1, self.num_heads, self.d_head)                                   # BxQ_LENxNxD
+        return x.permute(2, 0, 1, 3).contiguous().view(batch_size * self.num_heads, -1, self.d_head)    # BNxQ_LENxD
 
 class RelativeMultiHeadAttention(nn.Module):
     """
@@ -350,10 +351,10 @@ class RelativeMultiHeadAttention(nn.Module):
     ) -> Tensor:
         batch_size = value.size(0)
 
-        query = self.query_proj(query).view(batch_size, -1, self.num_heads, self.d_head)
-        key = self.key_proj(key).view(batch_size, -1, self.num_heads, self.d_head).permute(0, 2, 1, 3)
-        value = self.value_proj(value).view(batch_size, -1, self.num_heads, self.d_head).permute(0, 2, 1, 3)
-        pos_embedding = self.pos_proj(pos_embedding).view(batch_size, -1, self.num_heads, self.d_head)
+        query = self._proj(self.query_proj, query, batch_size)
+        key = self._proj(self.key_proj, key, batch_size).permute(0, 2, 1, 3)
+        value = self._proj(self.value_proj, value, batch_size).permute(0, 2, 1, 3)
+        pos_embedding = self._proj(self.pos_proj, pos_embedding, batch_size).permute(0, 2, 1, 3)
 
         content_score = torch.matmul((query + self.u_bias).transpose(1, 2), key.transpose(2, 3))
         pos_score = torch.matmul((query + self.v_bias).transpose(1, 2), pos_embedding.permute(0, 2, 3, 1))
@@ -382,6 +383,9 @@ class RelativeMultiHeadAttention(nn.Module):
         pos_score = padded_pos_score[:, :, 1:].view_as(pos_score)
 
         return pos_score
+    
+    def _proj(self, proj: nn.Module, x: Tensor, batch_size: int) -> Tensor:
+        return proj(x).view(batch_size, -1, self.num_heads, self.d_head)
 
 
 class CustomizingAttention(nn.Module):
@@ -419,12 +423,12 @@ class CustomizingAttention(nn.Module):
         self.dim = int(hidden_dim / num_heads)
         self.scaled_dot_attn = ScaledDotProductAttention(self.dim)
         self.conv1d = nn.Conv1d(1, conv_out_channel, kernel_size=3, padding=1)
-        self.query_proj = nn.Linear(hidden_dim, self.dim * num_heads, bias=True)
-        self.value_proj = nn.Linear(hidden_dim, self.dim * num_heads, bias=False)
+        self.query_proj = nn.Linear(hidden_dim, self.hidden_dim, bias=True)
+        self.value_proj = nn.Linear(hidden_dim, self.hidden_dim, bias=False)
         self.loc_proj = nn.Linear(conv_out_channel, self.dim, bias=False)
-        self.bias = nn.Parameter(torch.rand(self.dim * num_heads).uniform_(-0.1, 0.1))
+        self.bias = nn.Parameter(torch.rand(self.hidden_dim).uniform_(-0.1, 0.1))
 
-    def forward(self, query: Tensor, value: Tensor, last_attn: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, query: Tensor, value: Tensor, last_attn: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         batch_size, q_len, v_len = value.size(0), query.size(1), value.size(1)
 
         if last_attn is None:
@@ -432,13 +436,8 @@ class CustomizingAttention(nn.Module):
 
         loc_energy = self.get_loc_energy(last_attn, batch_size, v_len)  # get location energy
 
-        query = self.query_proj(query).view(batch_size, q_len, self.num_heads * self.dim)
-        value = self.value_proj(value).view(batch_size, v_len, self.num_heads * self.dim) + loc_energy + self.bias
-
-        query = query.view(batch_size, q_len, self.num_heads, self.dim).permute(2, 0, 1, 3)
-        value = value.view(batch_size, v_len, self.num_heads, self.dim).permute(2, 0, 1, 3)
-        query = query.contiguous().view(-1, q_len, self.dim)
-        value = value.contiguous().view(-1, v_len, self.dim)
+        query = self._proj(self.query_proj, query, batch_size, q_len)
+        value = self._proj(self.value_proj, value, batch_size, v_len, loc_energy + self.bias)
 
         context, attn = self.scaled_dot_attn(query, value)
         attn = attn.squeeze()
@@ -453,6 +452,13 @@ class CustomizingAttention(nn.Module):
         conv_feat = conv_feat.view(batch_size, self.num_heads, -1, v_len).permute(0, 1, 3, 2)
 
         loc_energy = self.loc_proj(conv_feat).view(batch_size, self.num_heads, v_len, self.dim)
-        loc_energy = loc_energy.permute(0, 2, 1, 3).reshape(batch_size, v_len, self.num_heads * self.dim)
+        loc_energy = loc_energy.permute(0, 2, 1, 3).reshape(batch_size, v_len, self.hidden_dim)
 
         return loc_energy
+
+    def _proj(self, proj: nn.Module, x: Tensor, batch_size: int, x_len: int, loc_energy: Optional[Tensor] = None) -> Tensor:
+        x = proj(x).view(batch_size, x_len, self.hidden_dim)
+        if loc_energy:
+            x += loc_energy
+        x = x.view(batch_size, x_len, self.hidden_dim).permute(2, 0, 1, 3)
+        return x.contiguous().view(-1, x_len, self.dim)
