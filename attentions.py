@@ -207,10 +207,8 @@ class MultiHeadLocationAwareAttention(nn.Module):
         loc_energy = torch.tanh(self.loc_proj(self.conv1d(last_attn).transpose(1, 2)))
         loc_energy = loc_energy.unsqueeze(1).repeat(1, self.num_heads, 1, 1).view(-1, seq_len, self.dim)
 
-        query = self._proj(self.query_proj, query, batch_size)
-        value = self._proj(self.value_proj, value, batch_size)
-        query = query.contiguous().view(-1, 1, self.dim)
-        value = value.contiguous().view(-1, seq_len, self.dim)
+        query = self._proj(self.query_proj, query, batch_size, 1)
+        value = self._proj(self.value_proj, value, batch_size, seq_len)
 
         score = self.attn_score(value + query + loc_energy).squeeze(2)
         attn = F.softmax(score, dim=1)
@@ -223,8 +221,9 @@ class MultiHeadLocationAwareAttention(nn.Module):
 
         return context, attn
 
-    def _proj(self, proj: nn.Module, x: Tensor, batch_size: int) -> Tensor:
-        return proj(x).view(batch_size, -1, self.hidden_dim).permute(0, 2, 1, 3)
+    def _proj(self, proj: nn.Module, x: Tensor, batch_size: int, out_len: int) -> Tensor:
+        x = proj(x).view(batch_size, -1, self.hidden_dim).permute(0, 2, 1, 3)
+        return x.contiguous().view(-1, out_len, self.dim)
 
 class MultiHeadAttention(nn.Module):
     """
@@ -271,7 +270,7 @@ class MultiHeadAttention(nn.Module):
 
         self.d_head = int(d_model / num_heads)
         self.num_heads = num_heads
-        self.scaled_dot_attn = ScaledDotProductAttention(self.d_head)
+        self.scaled_dot_attn = ScaledDotProductAttention()
         self.query_proj = nn.Linear(d_model, d_model)
         self.key_proj = nn.Linear(d_model, d_model)
         self.value_proj = nn.Linear(d_model, d_model)
@@ -423,13 +422,12 @@ class CustomizingAttention(nn.Module):
         - **Attention Is All You Need**: https://arxiv.org/abs/1706.03762
         - **Attention-Based Models for Speech Recognition**: https://arxiv.org/abs/1506.07503
     """
-
     def __init__(self, hidden_dim: int, num_heads: int = 4, conv_out_channel: int = 10) -> None:
         super(CustomizingAttention, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.dim = int(hidden_dim / num_heads)
-        self.scaled_dot_attn = ScaledDotProductAttention(self.dim)
+        self.dot_attn = DotProductAttention(self.dim)
         self.conv1d = nn.Conv1d(1, conv_out_channel, kernel_size=3, padding=1)
         self.query_proj = nn.Linear(hidden_dim, self.hidden_dim, bias=True)
         self.value_proj = nn.Linear(hidden_dim, self.hidden_dim, bias=False)
@@ -447,7 +445,7 @@ class CustomizingAttention(nn.Module):
         query = self._proj(self.query_proj, query, batch_size, q_len)
         value = self._proj(self.value_proj, value, batch_size, v_len, loc_energy + self.bias)
 
-        context, attn = self.scaled_dot_attn(query, value)
+        context, attn = self.dot_attn(query, value)
         attn = attn.squeeze()
 
         context = context.view(self.num_heads, batch_size, q_len, self.dim).permute(1, 2, 0, 3)
