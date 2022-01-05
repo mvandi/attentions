@@ -58,6 +58,17 @@ class DotProductAttention(nn.Module):
         return context, attn
 
 
+class AttentionScore(nn.Module):
+
+    def __init__(self, hidden_dim: int) -> None:
+        super(AttentionScore, self).__init__()
+        self.proj = nn.Linear(hidden_dim, 1)
+        self.bias = nn.Parameter(torch.rand(hidden_dim).uniform_(-0.1, 0.1))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(torch.tanh(x + self.bias))
+
+
 class AdditiveAttention(nn.Module):
     """
      Applies a additive attention (bahdanau) mechanism on the output features from the decoder.
@@ -81,11 +92,12 @@ class AdditiveAttention(nn.Module):
         super(AdditiveAttention, self).__init__()
         self.query_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.key_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.bias = nn.Parameter(torch.rand(hidden_dim).uniform_(-0.1, 0.1))
-        self.score_proj = nn.Linear(hidden_dim, 1)
+        self.attn_score = AttentionScore(hidden_dim)
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor) -> Tuple[Tensor, Tensor]:
-        score = self.score_proj(torch.tanh(self.key_proj(key) + self.query_proj(query) + self.bias)).squeeze(-1)
+        key = self.key_proj(key)
+        query = self.query_proj(query)
+        score = self.attn_score(key + query).squeeze(-1)
         attn = F.softmax(score, dim=-1)
         context = torch.bmm(attn.unsqueeze(1), value)
         return context, attn
@@ -121,8 +133,7 @@ class LocationAwareAttention(nn.Module):
         self.conv1d = nn.Conv1d(in_channels=1, out_channels=hidden_dim, kernel_size=3, padding=1)
         self.query_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.value_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.score_proj = nn.Linear(hidden_dim, 1, bias=True)
-        self.bias = nn.Parameter(torch.rand(hidden_dim).uniform_(-0.1, 0.1))
+        self.attn_score = AttentionScore(hidden_dim)
         self.smoothing = smoothing
 
     def forward(self, query: Tensor, value: Tensor, last_attn: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
@@ -135,9 +146,7 @@ class LocationAwareAttention(nn.Module):
         query = self._proj(self.query_proj, query, batch_size, hidden_dim)
         value = self._proj(self.value_proj, value, batch_size, hidden_dim)
         conv_attn = torch.transpose(self.conv1d(last_attn.unsqueeze(1)), 1, 2)
-        score = self.score_proj(torch.tanh(
-            query + value + conv_attn + self.bias
-        )).squeeze(dim=-1)
+        score = self.attn_score(query + value + conv_attn).squeeze(dim=-1)
 
         if self.smoothing:
             score = torch.sigmoid(score)
@@ -187,8 +196,7 @@ class MultiHeadLocationAwareAttention(nn.Module):
         self.loc_proj = nn.Linear(conv_out_channel, self.dim, bias=False)
         self.query_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.value_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.score_proj = nn.Linear(self.dim, 1, bias=True)
-        self.bias = nn.Parameter(torch.rand(self.dim).uniform_(-0.1, 0.1))
+        self.attn_score = AttentionScore(hidden_dim)
 
     def forward(self, query: Tensor, value: Tensor, last_attn: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         batch_size, seq_len = value.size(0), value.size(1)
@@ -204,7 +212,7 @@ class MultiHeadLocationAwareAttention(nn.Module):
         query = query.contiguous().view(-1, 1, self.dim)
         value = value.contiguous().view(-1, seq_len, self.dim)
 
-        score = self.score_proj(torch.tanh(value + query + loc_energy + self.bias)).squeeze(2)
+        score = self.attn_score(value + query + loc_energy).squeeze(2)
         attn = F.softmax(score, dim=1)
 
         value = value.view(batch_size, seq_len, self.hidden_dim).permute(0, 2, 1, 3)
